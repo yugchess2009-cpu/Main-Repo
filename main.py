@@ -39,7 +39,6 @@ GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "dummy")
 BOT_USERNAME   = os.environ.get("BOT_USERNAME", "").lower()
 MEME_PATH      = os.path.join(os.path.dirname(__file__), "assets", "padhai_meme.jpg")
 
-# Two clients — one for text, one for vision
 text_client = AsyncOpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1"
@@ -412,6 +411,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         await msg.reply_text(clean)
 
+# ── Text message handler ──────────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg     = update.message
     text    = msg.text or ""
@@ -440,6 +440,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         await msg.reply_text(clean, **kwargs)
 
+# ── Startup ───────────────────────────────────────────────────────────────────
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -456,7 +457,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot started successfully!")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
