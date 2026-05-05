@@ -1,4 +1,3 @@
-Content is user-generated and unverified.
 import threading
 import re
 import json
