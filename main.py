@@ -1,4 +1,8 @@
 import threading
+import re
+import json
+import asyncio
+from datetime import datetime, date
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 class Handler(BaseHTTPRequestHandler):
@@ -9,7 +13,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-threading.Thread(target=lambda: HTTPServer(('0.0.0.0', 8080), Handler).serve_forever(), daemon=True).start()
+threading.Thread(
+    target=lambda: HTTPServer(('0.0.0.0', 8080), Handler).serve_forever(),
+    daemon=True
+).start()
 
 import os
 import base64
@@ -17,7 +24,7 @@ import random
 import logging
 from collections import defaultdict
 from openai import AsyncOpenAI
-from telegram import Update, Message
+from telegram import Update, Message, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -26,32 +33,32 @@ from telegram.ext import (
     filters,
 )
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── Environment ───────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "dummy")
-BOT_USERNAME   = os.environ.get("BOT_USERNAME", "").lower()
-MEME_PATH      = os.path.join(os.path.dirname(__file__), "assets", "padhai_meme.jpg")
+# ── Environment ────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "dummy")
+BOT_USERNAME     = os.environ.get("BOT_USERNAME", "").lower()
+BASE_DIR         = os.path.dirname(__file__)
+MEME_PATH        = os.path.join(BASE_DIR, "assets", "padhai_meme.jpg")
+LEADERBOARD_FILE = os.path.join(BASE_DIR, "leaderboard.json")
+DAILY_FILE       = os.path.join(BASE_DIR, "daily_question.json")
 
-text_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
-vision_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
+text_client   = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+vision_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
 TEXT_MODEL   = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+TODAY = lambda: date.today().isoformat()          # "2026-05-05"
+TODAY_LABEL = lambda: datetime.now().strftime("%d %b %Y")
+
+# ── System prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a warm, sharp JEE tutor — like a caring elder sibling who wants you to succeed.
 
 PERSONALITY:
@@ -68,272 +75,632 @@ STRICT RULES:
 7. No filler, no repetition.
 
 SPECIAL CASES — handle these warmly, never with [OFF_TOPIC]:
-- Compliments, appreciation, thank you, nice words about the bot → respond warmly and encourage them to keep studying.
-- Questions about what the bot can do, how it works, who made it → answer kindly and briefly.
-- Greetings (hello, hi, good morning) → greet back warmly and invite them to ask a doubt.
-- Study-related chat (asking about study plans, feeling stuck, exam stress, motivation) → be warm and supportive, give practical advice.
+- Compliments, appreciation, thank you → respond warmly and encourage them.
+- Questions about what the bot can do → answer kindly and briefly.
+- Greetings → greet back warmly and invite them to ask a doubt.
+- Study-related chat, exam stress, feeling stuck → be warm and supportive.
 
-ONLY use [OFF_TOPIC] for messages clearly unrelated to JEE, studying, or the bot itself — like gossip, movies, cricket scores, politics, relationships, etc.
+ONLY use [OFF_TOPIC] for messages clearly unrelated to JEE, studying, or the bot — like gossip, movies, cricket scores, politics, relationships.
 When off-topic, reply with exactly:
 [OFF_TOPIC]
-Then one warm line gently nudging them back to studying. Do NOT be rude."""
+Then one warm line gently nudging them back. Do NOT be rude."""
 
-# ── Savage off-topic replies ──────────────────────────────────────────────────
+# ── Savage off-topic replies ───────────────────────────────────────────────────
 SAVAGE_REPLIES = [
-    "Arey laala, ye mera syllabus nahi hai.\nPadhle padhle — kyu nahi horhi padhai? Aa, ek doubt pooch.",
-    "Yaar, ye cheez JEE mein nahi aati, lekin Newton ke laws zaroor aate hain.\nChal ek doubt bhej, solve karte hain!",
-    "Galat jagah aa gaya thoda, bhai.\nMera kaam Physics, Chemistry aur Maths hai — aa, kuch pooch.",
-    "Haha, ye toh main nahi jaanta laala.\nLekin projectile motion zaroor jaanta hoon. Padh le thoda!",
+    "Arey laala, ye mera syllabus nahi hai.\nPadhle — aa, ek doubt pooch.",
+    "Yaar, ye JEE mein nahi aati, lekin Newton ke laws zaroor aate hain.\nEk doubt bhej, solve karte hain!",
+    "Galat jagah aa gaya thoda.\nMera kaam Physics, Chemistry aur Maths hai — kuch pooch.",
+    "Haha, ye toh main nahi jaanta laala.\nLekin projectile motion zaroor jaanta hoon. Padh le!",
     "Padhle padhle — kyu nahi horhi padhai?\nBook khol, ek question pooch, main hoon na.",
-    "Yaar, JEE ke baad yeh sab poochna — tab main bhi baat karunga.\nAbhi ek doubt bhej de, chal shuru karte hain.",
-    "Mujhe ye nahi aata, but integration aata hai.\nKuch aur nahi toh ek formula puch le, laala!",
-    "Bhai, ye topic toh mera nahi hai — Physics, Chemistry, Maths mera kaam hai.\nAa, saath mein padhte hain.",
-    "Sahi sawaal galat bot pe pooch liya.\nLekin sahi bot pe sahi sawaal bhi pooch — ek doubt try kar!",
+    "JEE ke baad yeh sab poochna — tab baat karunga.\nAbhi ek doubt bhej de.",
+    "Mujhe ye nahi aata, but integration aata hai.\nKuch aur nahi toh ek formula puch le!",
+    "Bhai, ye topic mera nahi — Physics, Chem, Math mera kaam hai.\nAa, saath mein padhte hain.",
     "Laala, ye mera field nahi — lekin tera IIT ka sapna mera field hai.\nPadhle, main hoon yahan.",
 ]
 
-# ── Study & stress tips ───────────────────────────────────────────────────────
+# ── Tips & quotes ──────────────────────────────────────────────────────────────
 TIPS = [
-    "Study tip: Use the Pomodoro technique — 25 minutes of focused study, then a 5-minute break. Repeat 4 times, then take a longer break.",
-    "Stress tip: When overwhelmed, write down every pending task. A clear list is less scary than a foggy mind.",
-    "Study tip: Teach what you just learned to an imaginary student. If you can explain it simply, you truly understand it.",
-    "Stress tip: Take 5 deep breaths — inhale for 4 counts, hold for 4, exhale for 4. It resets your nervous system instantly.",
-    "Study tip: Solve at least 10 problems on every new concept before moving on. Understanding without practice is incomplete.",
-    "Stress tip: Step outside for 10 minutes. Sunlight and fresh air reset your focus better than staring at a wall.",
-    "Study tip: Revise the previous day's topics for the first 15 minutes of each session. Spaced repetition builds long-term memory.",
-    "Stress tip: Drink water. Most brain fog is just dehydration. Keep a bottle on your study table always.",
-    "Study tip: Do the hardest subject first when your energy is at its peak, usually in the morning.",
-    "Stress tip: Stop comparing your chapter count with others. Your journey is not their journey. Focus on your own progress.",
-    "Study tip: Make a formula sheet as you study each chapter. Revising it before sleep takes 5 minutes and works wonders.",
-    "Stress tip: Sleep 7-8 hours. Memory consolidation happens during sleep. Pulling all-nighters deletes more than it adds.",
-    "Study tip: Attempt previous year JEE papers topic-wise, not just full papers. It shows you exactly what the exam expects.",
-    "Stress tip: Do not read news or social media during study hours. Every distraction breaks your focus for 20+ minutes.",
-    "Study tip: Mark your weak topics and schedule extra time for them instead of always revising what you already know.",
-    "Stress tip: Talk to someone you trust when pressure feels heavy. Bottling up stress makes it worse, not better.",
-    "Study tip: Write your own short notes while studying. The act of writing reinforces memory far better than re-reading.",
-    "Stress tip: Exercise for even 20 minutes a day. Physical activity reduces cortisol and improves concentration significantly.",
-    "Study tip: Group similar concepts together — for example, all electrochemistry in one block. Connections make recall faster.",
-    "Stress tip: Set a fixed end time for studying each night. Knowing you will stop at 11 PM makes the study hours more focused.",
-    "Study tip: Mistakes in practice are good. Analyze each wrong answer — do not just check the answer and move on.",
-    "Stress tip: Your worth is not your rank. You are more than your JEE result. Do your best and trust the process.",
-    "Study tip: Use diagrams and flowcharts for complex topics like organic reaction mechanisms or thermodynamic cycles.",
-    "Stress tip: Before sleeping, write three things you did well today. Small wins compound into confidence.",
-    "Study tip: Solve numericals without a calculator occasionally. Mental math speed matters in the exam hall.",
-    "Stress tip: Eat proper meals. Skipping lunch to study more is a bad trade — a hungry brain retains nothing.",
-    "Study tip: If a concept confuses you, come back to it after a day. Sometimes rest gives your brain the time to connect the dots.",
-    "Stress tip: Your exam hall performance depends on 90 days of preparation, not the last 90 minutes before it. Prepare early.",
-    "Study tip: Read the question fully before solving. Half the mistakes in JEE come from misreading, not miscalculating.",
-    "Stress tip: Celebrate small milestones — finished a chapter, solved a tough problem, scored well in a mock. Reward yourself.",
+    "Pomodoro technique — 25 min study, 5 min break. Repeat 4x, then a long rest.",
+    "When overwhelmed, write down every pending task. A clear list beats a foggy mind.",
+    "Teach what you just learned to an imaginary student. If you can explain it simply, you truly understand it.",
+    "5 deep breaths — inhale 4 counts, hold 4, exhale 4. Resets your nervous system instantly.",
+    "Solve at least 10 problems on every new concept. Understanding without practice is incomplete.",
+    "Step outside for 10 minutes. Sunlight and fresh air reset focus better than staring at a wall.",
+    "Revise yesterday's topics for the first 15 minutes of each session. Spaced repetition works.",
+    "Drink water. Most brain fog is just dehydration. Keep a bottle on your study table.",
+    "Do the hardest subject first when energy is at its peak — usually morning.",
+    "Stop comparing your chapter count with others. Your journey is not theirs.",
+    "Make a formula sheet as you study each chapter. 5 min before sleep works wonders.",
+    "Sleep 7-8 hours. Memory consolidation happens during sleep. All-nighters delete more than they add.",
+    "Attempt previous year JEE papers topic-wise. It shows exactly what the exam expects.",
+    "Avoid social media during study hours. Every distraction costs 20+ minutes of focus.",
+    "Mark weak topics and schedule extra time for them instead of always revising strengths.",
+    "Talk to someone you trust when pressure feels heavy. Bottling up stress makes it worse.",
+    "Write your own short notes while studying. Writing reinforces memory far better than re-reading.",
+    "Exercise for 20 minutes a day. It reduces cortisol and improves concentration significantly.",
+    "Group similar concepts together. Connections make recall faster.",
+    "Analyze each wrong answer in detail. Do not just check the answer and move on.",
+    "Your worth is not your rank. You are more than your JEE result. Do your best.",
+    "Read the question fully before solving. Half the JEE mistakes come from misreading.",
+    "Celebrate small milestones — finished a chapter, solved a tough problem. Reward yourself.",
 ]
 
-# ── Motivational quotes ───────────────────────────────────────────────────────
 QUOTES = [
     "The expert in anything was once a beginner. Keep going.",
-    "You don't have to be great to start, but you have to start to be great.",
     "Consistency beats talent when talent doesn't show up every day.",
     "Hard work beats genius when genius doesn't work hard.",
-    "Every problem you solve today is one fewer on exam day.",
     "The pain of discipline is far less than the pain of regret.",
     "Your future self is watching you right now. Make them proud.",
     "IIT is not a dream for those who chase it — it is a decision.",
-    "Ordinary efforts produce ordinary results. You are built for more.",
-    "One more revision. One more problem. One more step forward.",
-    "Success doesn't come from what you do occasionally, it comes from what you do consistently.",
     "Champions train when no one is watching.",
     "Pressure makes diamonds. Embrace it.",
     "You have survived every hard day so far. Today is no different.",
     "Study not to pass, but to know. Passing will follow.",
     "The rank you want is earned in the hours no one sees.",
     "A year from now you will wish you had started harder today.",
-    "Focus on progress, not perfection.",
-    "Rest if you must, but never quit.",
+    "Focus on progress, not perfection. Rest if you must, but never quit.",
     "The goal is not to be better than others — it is to be better than your yesterday.",
     "Every formula you memorize today is a second saved on exam day.",
-    "The student who asks questions learns faster than the one who pretends to understand.",
     "Mistakes are proof that you are trying.",
     "Small daily improvements lead to stunning long-term results.",
     "You are closer than you think. Do not stop now.",
-    "Physics, Chemistry, Math — three mountains. Climb them one step at a time.",
-    "Clarity comes with effort. Keep working.",
     "Believe in the process. The result will take care of itself.",
     "Discipline is choosing what you want most over what you want now.",
-    "Your mind is your most powerful tool. Sharpen it every day.",
     "Doubt your doubts before you doubt your abilities.",
-    "The harder the battle, the sweeter the victory.",
     "Success is the sum of small efforts repeated day in and day out.",
-    "You were not born to be average. Prove it.",
     "Weak moments are temporary. Your potential is permanent.",
-    "Learn from yesterday, work for today, aim for tomorrow.",
-    "The best time to study was yesterday. The second best time is now.",
     "Do not wait for motivation — build discipline instead.",
-    "Every hour of focused study compounds over time.",
-    "Outwork your excuses.",
     "Think like a topper. Work like a topper. Become one.",
-    "Solve one problem at a time and the exam becomes manageable.",
     "The syllabus is finite. Your effort can be limitless.",
-    "Start before you feel ready.",
-    "Revision is not repetition — it is reinforcement.",
-    "Struggle builds strength. Welcome it.",
+    "Start before you feel ready. Revision is not repetition — it is reinforcement.",
     "The top rank belongs to those who refused to give up.",
-    "Your rank is decided today, not on exam day.",
-    "Be the student you needed when you were confused.",
     "Excellence is not a destination — it is a habit you build daily.",
+    "Outwork your excuses. Your rank is decided today, not on exam day.",
 ]
 
-# ── Conversation history (per user, max 12 turns) ─────────────────────────────
-MAX_HISTORY = 12
-history: dict[int, list[dict]] = defaultdict(list)
+# ── Achievement badges ─────────────────────────────────────────────────────────
+def get_badge(pct: float) -> str:
+    if pct == 100:  return "PERFECT SCORE — Legend status!"
+    if pct >= 90:   return "Elite Performer — IIT material!"
+    if pct >= 75:   return "Strong Performance — Keep it up!"
+    if pct >= 60:   return "Good Effort — Almost there!"
+    if pct >= 40:   return "Keep Going — Practice makes perfect."
+    return                  "Rookie Mode — Revisit this chapter."
 
-def build_messages(user_id: int, content) -> list[dict]:
-    hist = history[user_id]
+def get_grade(pct: float) -> str:
+    if pct == 100:  return "S"
+    if pct >= 90:   return "A+"
+    if pct >= 75:   return "A"
+    if pct >= 60:   return "B"
+    if pct >= 40:   return "C"
+    return                  "D"
+
+def progress_bar(pct: float, width: int = 10) -> str:
+    filled = round(pct / 100 * width)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+def streak_fire(n: int) -> str:
+    if n == 0:   return ""
+    if n < 3:    return " (getting started!)"
+    if n < 7:    return " (on a roll!)"
+    if n < 14:   return " (unstoppable!)"
+    if n < 30:   return " (LEGEND streak!)"
+    return               " (GOD MODE!)"
+
+# ── Leaderboard / stats persistence ───────────────────────────────────────────
+def load_leaderboard() -> dict:
+    try:
+        with open(LEADERBOARD_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_leaderboard(lb: dict) -> None:
+    try:
+        with open(LEADERBOARD_FILE, "w") as f:
+            json.dump(lb, f, indent=2)
+    except Exception as e:
+        logger.error("Leaderboard save error: %s", e)
+
+def record_quiz_score(uid: int, name: str, score: int, total: int, chapter: str, topic: str) -> None:
+    lb  = load_leaderboard()
+    key = str(uid)
+    pct = round((score / total) * 100, 1)
+    today = TODAY()
+
+    entry = lb.get(key, {
+        "name": name, "total_quizzes": 0, "total_correct": 0, "total_questions": 0,
+        "best_pct": 0.0, "best_score": 0, "best_total": 0,
+        "best_chapter": "", "best_topic": "", "best_date": "",
+        "chapter_stats": {}, "streak": 0, "last_quiz_date": "", "quiz_history": [],
+    })
+
+    # ensure new fields exist on old entries
+    entry.setdefault("chapter_stats", {})
+    entry.setdefault("streak", 0)
+    entry.setdefault("last_quiz_date", "")
+    entry.setdefault("quiz_history", [])
+
+    entry["name"] = name
+    entry["total_quizzes"]   += 1
+    entry["total_correct"]   += score
+    entry["total_questions"] += total
+
+    # chapter stats
+    cs = entry["chapter_stats"]
+    if chapter not in cs:
+        cs[chapter] = {"correct": 0, "total": 0}
+    cs[chapter]["correct"] += score
+    cs[chapter]["total"]   += total
+
+    # streak
+    last = entry["last_quiz_date"]
+    if last == today:
+        pass  # same day, keep streak
+    elif last == date.fromisoformat(today).replace(day=date.fromisoformat(today).day - 1).isoformat() if last else False:
+        entry["streak"] += 1
+    else:
+        # check properly
+        try:
+            from datetime import timedelta
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            if last == yesterday:
+                entry["streak"] += 1
+            elif last == today:
+                pass
+            else:
+                entry["streak"] = 1
+        except Exception:
+            entry["streak"] = 1
+    entry["last_quiz_date"] = today
+
+    # best performance
+    if pct >= entry["best_pct"]:
+        entry["best_pct"]     = pct
+        entry["best_score"]   = score
+        entry["best_total"]   = total
+        entry["best_chapter"] = chapter
+        entry["best_topic"]   = topic
+        entry["best_date"]    = TODAY_LABEL()
+
+    # quiz history (keep last 10)
+    entry["quiz_history"].append({
+        "score": score, "total": total, "pct": pct,
+        "chapter": chapter, "topic": topic, "date": TODAY_LABEL(),
+    })
+    entry["quiz_history"] = entry["quiz_history"][-10:]
+
+    lb[key] = entry
+    save_leaderboard(lb)
+
+def get_user_entry(uid: int) -> dict | None:
+    lb = load_leaderboard()
+    return lb.get(str(uid))
+
+def build_leaderboard_text() -> str:
+    lb = load_leaderboard()
+    if not lb:
+        return "No scores yet — be the first! Type /quiz to start."
+
+    entries = sorted(lb.values(), key=lambda e: (-e["best_pct"], -e.get("total_correct", 0)))
+    medal_icons = ["GOLD", "SILVER", "BRONZE"]
+    lines = ["=== JEE Quiz Leaderboard ===\n"]
+
+    for i, e in enumerate(entries[:10]):
+        rank    = medal_icons[i] if i < 3 else f"#{i+1}"
+        overall = round(e["total_correct"] / e["total_questions"] * 100, 1) if e.get("total_questions") else 0
+        streak  = e.get("streak", 0)
+        streak_tag = f"  |  {streak}d streak{streak_fire(streak)}" if streak > 0 else ""
+        lines.append(
+            f"{rank}  {e['name']}\n"
+            f"  Best: {e['best_score']}/{e['best_total']} ({e['best_pct']}%) — {e.get('best_chapter','')} : {e.get('best_topic','')}\n"
+            f"  Overall: {e['total_correct']}/{e['total_questions']} ({overall}%)  |  {e['total_quizzes']} quiz(zes){streak_tag}"
+        )
+
+    lines.append("\nType /quiz to climb the ranks!")
+    return "\n\n".join(lines)
+
+def build_mystats_text(uid: int) -> str:
+    e = get_user_entry(uid)
+    if not e:
+        return "You have not completed any quiz yet!\nType /quiz to get started and build your stats."
+
+    overall = round(e["total_correct"] / e["total_questions"] * 100, 1) if e.get("total_questions") else 0
+    streak  = e.get("streak", 0)
+    cs      = e.get("chapter_stats", {})
+
+    best_chap  = max(cs, key=lambda c: cs[c]["correct"] / cs[c]["total"] if cs[c]["total"] else 0, default=None)
+    worst_chap = min(cs, key=lambda c: cs[c]["correct"] / cs[c]["total"] if cs[c]["total"] else 1, default=None)
+
+    best_chap_pct  = round(cs[best_chap]["correct"]  / cs[best_chap]["total"]  * 100, 1) if best_chap  else 0
+    worst_chap_pct = round(cs[worst_chap]["correct"] / cs[worst_chap]["total"] * 100, 1) if worst_chap else 0
+
+    history = e.get("quiz_history", [])
+    recent_lines = ""
+    if history:
+        recent_lines = "\nRecent Quizzes:\n"
+        for h in reversed(history[-5:]):
+            recent_lines += f"  {h['date']}  {h['score']}/{h['total']} ({h['pct']}%)  {h['chapter']}\n"
+
+    streak_line = f"{streak} day(s){streak_fire(streak)}" if streak else "0 (take a quiz today!)"
+
+    return (
+        f"=== Your JEE Stats ===\n\n"
+        f"Name          : {e['name']}\n"
+        f"Total Quizzes : {e['total_quizzes']}\n"
+        f"Overall Score : {e['total_correct']}/{e['total_questions']} ({overall}%)\n"
+        f"{progress_bar(overall)}\n\n"
+        f"Best Quiz  : {e['best_score']}/{e['best_total']} ({e['best_pct']}%)\n"
+        f"Best Topic : {e.get('best_chapter','')} — {e.get('best_topic','')}\n"
+        f"Best Date  : {e.get('best_date','')}\n\n"
+        f"Strongest  : {best_chap} ({best_chap_pct}%)\n" if best_chap else ""
+        f"Weakest    : {worst_chap} ({worst_chap_pct}%)\n" if worst_chap else ""
+        f"Streak     : {streak_line}\n"
+        f"{recent_lines}"
+        f"\nType /rank to see your leaderboard position."
+    )
+
+def build_rank_text(uid: int, name: str) -> str:
+    lb = load_leaderboard()
+    if not lb or str(uid) not in lb:
+        return "You have not completed any quiz yet — type /quiz to enter the rankings!"
+
+    entries = sorted(lb.values(), key=lambda e: (-e["best_pct"], -e.get("total_correct", 0)))
+    uid_str = str(uid)
+    my_rank = next((i + 1 for i, e_pair in enumerate(
+        sorted(lb.items(), key=lambda kv: (-kv[1]["best_pct"], -kv[1].get("total_correct", 0)))
+    ) if e_pair[0] == uid_str), None)
+
+    if my_rank is None:
+        return "You are not on the leaderboard yet. Complete a quiz first!"
+
+    me = lb[uid_str]
+    total = len(entries)
+    lines = [f"=== Your Rank ===\n\nYou are #{my_rank} out of {total} student(s)."]
+
+    if my_rank == 1:
+        lines.append("You are at the TOP! Keep defending that throne.")
+    else:
+        above = entries[my_rank - 2]
+        gap   = round(above["best_pct"] - me["best_pct"], 1)
+        lines.append(f"One above you: {above['name']} ({above['best_pct']}%)\nGap to beat: {gap}% — you can close this!")
+
+    if my_rank < total:
+        below = entries[my_rank]
+        lines.append(f"One below you: {below['name']} ({below['best_pct']}%) — they are coming for you!")
+
+    overall = round(me["total_correct"] / me["total_questions"] * 100, 1) if me.get("total_questions") else 0
+    lines.append(f"\nYour best: {me['best_pct']}%  |  Overall: {overall}%\nType /quiz to improve your rank!")
+    return "\n\n".join(lines)
+
+# ── Daily question persistence ─────────────────────────────────────────────────
+def load_daily() -> dict:
+    try:
+        with open(DAILY_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_daily(data: dict) -> None:
+    try:
+        with open(DAILY_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error("Daily save error: %s", e)
+
+async def get_or_generate_daily() -> dict | None:
+    today = TODAY()
+    data  = load_daily()
+    if data.get("date") == today and data.get("question"):
+        return data
+
+    # pick a random JEE topic for the daily
+    topics = [
+        ("Kinematics",         "Projectile Motion"),
+        ("Laws of Motion",     "Newton's Second Law"),
+        ("Work Energy Power",  "Conservation of Energy"),
+        ("Thermodynamics",     "Carnot Cycle"),
+        ("Electrostatics",     "Coulomb's Law"),
+        ("Current Electricity","Kirchhoff's Laws"),
+        ("Optics",             "Refraction"),
+        ("Organic Chemistry",  "SN1 and SN2 Reactions"),
+        ("Electrochemistry",   "Nernst Equation"),
+        ("Coordination Cmpds", "IUPAC Nomenclature"),
+        ("Matrices",           "Determinants"),
+        ("Limits",             "L'Hopital's Rule"),
+        ("Integration",        "Integration by Parts"),
+        ("Probability",        "Bayes' Theorem"),
+        ("3D Geometry",        "Distance Between Lines"),
+    ]
+    chapter, topic = random.choice(topics)
+
+    prompt = (
+        f"Generate one JEE Advanced level multiple choice question on '{topic}' from '{chapter}'.\n"
+        "Format EXACTLY:\n"
+        "QUESTION: [full question text]\n"
+        "A: [option]\nB: [option]\nC: [option]\nD: [option]\n"
+        "ANSWER: [A/B/C/D]\n"
+        "EXPLANATION: [one concise line]\n"
+        "No LaTeX — plain text formulas only."
+    )
+    try:
+        resp = await text_client.chat.completions.create(
+            model=TEXT_MODEL, max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.choices[0].message.content or ""
+        questions = parse_questions(raw + "\n###")
+        if not questions:
+            return None
+        q = questions[0]
+        data = {"date": today, "chapter": chapter, "topic": topic, "question": q, "answered_by": []}
+        save_daily(data)
+        return data
+    except Exception as e:
+        logger.error("Daily question gen error: %s", e)
+        return None
+
+def record_daily_answer(uid: int) -> None:
+    data = load_daily()
+    if "answered_by" not in data:
+        data["answered_by"] = []
+    uid_str = str(uid)
+    if uid_str not in data["answered_by"]:
+        data["answered_by"].append(uid_str)
+    save_daily(data)
+
+# ── Per-user state ─────────────────────────────────────────────────────────────
+MAX_HISTORY     = 12
+history: dict[int, list[dict]]  = defaultdict(list)
+identify_wait: set[int]         = set()
+quiz_setup: dict[int, dict]     = {}
+active_quiz: dict[int, dict]    = {}
+daily_wait: set[int]            = set()  # users who got the daily Q and are waiting to answer
+
+# ── Conversation history ───────────────────────────────────────────────────────
+def build_messages(uid: int, content) -> list[dict]:
+    hist = history[uid]
     hist.append({"role": "user", "content": content})
     if len(hist) > MAX_HISTORY * 2:
         del hist[:2]
     return [{"role": "system", "content": SYSTEM_PROMPT}] + hist
 
-def record_reply(user_id: int, reply: str) -> None:
-    history[user_id].append({"role": "assistant", "content": reply})
+def record_reply(uid: int, reply: str) -> None:
+    history[uid].append({"role": "assistant", "content": reply})
 
-# ── Text AI call ──────────────────────────────────────────────────────────────
-async def ask(user_id: int, content) -> str:
-    messages = build_messages(user_id, content)
+# ── AI calls ───────────────────────────────────────────────────────────────────
+async def ask(uid: int, content, max_tok: int = 500) -> str:
+    messages = build_messages(uid, content)
     try:
         resp = await text_client.chat.completions.create(
-            model=TEXT_MODEL,
-            max_tokens=500,
-            messages=messages,
+            model=TEXT_MODEL, max_tokens=max_tok, messages=messages,
         )
         reply = resp.choices[0].message.content or "Could not generate a response. Please try again."
-        record_reply(user_id, reply)
+        record_reply(uid, reply)
         return reply
     except Exception as e:
-        logger.error("Groq error: %s", e)
+        logger.error("Groq text error: %s", e)
         return "Something went wrong. Please try again in a moment."
 
-# ── Vision AI call ────────────────────────────────────────────────────────────
-async def ask_vision(instruction: str, b64: str) -> str:
+async def ask_vision(instruction: str, b64: str, max_tok: int = 700) -> str:
     try:
         resp = await vision_client.chat.completions.create(
-            model=VISION_MODEL,
-            max_tokens=700,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": instruction},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    ],
-                }
-            ],
+            model=VISION_MODEL, max_tokens=max_tok,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            ]}],
         )
         return resp.choices[0].message.content or "Could not read the image. Please try again."
     except Exception as e:
-        logger.error("Vision error: %s", e)
+        logger.error("Groq vision error: %s", e)
         return "I had trouble reading the image. Please try again."
 
-# ── Off-topic handler ─────────────────────────────────────────────────────────
+async def generate_quiz_questions(num: int, chapter: str, topic: str) -> list[dict] | None:
+    prompt = (
+        f"Generate exactly {num} JEE Advanced level multiple choice questions "
+        f"on the topic '{topic}' from the chapter '{chapter}'.\n\n"
+        "Format each question EXACTLY like this:\n"
+        "QUESTION: [full question with any numbers/scenarios]\n"
+        "A: [option A]\nB: [option B]\nC: [option C]\nD: [option D]\n"
+        "ANSWER: [A/B/C/D]\nEXPLANATION: [one concise line — why this answer is correct]\n"
+        "###\n\n"
+        "Rules:\n"
+        "- JEE Advanced difficulty — tricky, conceptual, and numerical\n"
+        "- All 4 options must be plausible and similar to confuse test-takers\n"
+        "- No LaTeX — plain text formulas only (e.g. F = ma)\n"
+        "- No repetition between questions\n"
+        f"- Generate exactly {num} questions, no more, no less"
+    )
+    max_tok = min(num * 220 + 500, 8000)
+    try:
+        resp = await text_client.chat.completions.create(
+            model=TEXT_MODEL, max_tokens=max_tok,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return parse_questions(resp.choices[0].message.content or "")
+    except Exception as e:
+        logger.error("Quiz generation error: %s", e)
+        return None
+
+def parse_questions(raw: str) -> list[dict]:
+    questions = []
+    for block in [b.strip() for b in raw.split("###") if b.strip()]:
+        q: dict = {}
+        for line in block.splitlines():
+            line = line.strip()
+            if line.startswith("QUESTION:"):   q["q"]   = line[9:].strip()
+            elif line.startswith("A:"):        q["A"]   = line[2:].strip()
+            elif line.startswith("B:"):        q["B"]   = line[2:].strip()
+            elif line.startswith("C:"):        q["C"]   = line[2:].strip()
+            elif line.startswith("D:"):        q["D"]   = line[2:].strip()
+            elif line.startswith("ANSWER:"):   q["ans"] = line[7:].strip().upper()
+            elif line.startswith("EXPLANATION:"): q["exp"] = line[12:].strip()
+        if all(k in q for k in ("q", "A", "B", "C", "D", "ans", "exp")):
+            questions.append(q)
+    return questions
+
+def format_question(q: dict, idx: int, total: int) -> str:
+    return (
+        f"Question {idx} of {total}\n\n"
+        f"{q['q']}\n\n"
+        f"A)  {q['A']}\n"
+        f"B)  {q['B']}\n"
+        f"C)  {q['C']}\n"
+        f"D)  {q['D']}\n\n"
+        "Reply with A, B, C, or D"
+    )
+
+def quiz_result_text(score: int, total: int, chapter: str, topic: str) -> str:
+    pct   = (score / total) * 100
+    grade = get_grade(pct)
+    badge = get_badge(pct)
+    bar   = progress_bar(pct)
+    return (
+        f"=== Quiz Complete! ===\n\n"
+        f"Chapter  : {chapter}\n"
+        f"Topic    : {topic}\n\n"
+        f"Score    : {score}/{total}  ({pct:.0f}%)\n"
+        f"Grade    : {grade}\n"
+        f"{bar}\n\n"
+        f"{badge}\n\n"
+        "Type /mystats to see all your stats\n"
+        "Type /leaderboard to see rankings\n"
+        "Type /quiz to go again!"
+    )
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
 async def send_savage_reply(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    savage = random.choice(SAVAGE_REPLIES)
-    await msg.reply_text(savage)
+    await msg.reply_text(random.choice(SAVAGE_REPLIES))
     try:
         with open(MEME_PATH, "rb") as f:
             await msg.reply_photo(photo=f)
     except Exception as e:
-        logger.warning("Could not send meme image: %s", e)
+        logger.warning("Meme send error: %s", e)
 
-def is_off_topic_response(text: str) -> tuple[bool, str]:
+def is_off_topic(text: str) -> tuple[bool, str]:
     if text.startswith("[OFF_TOPIC]"):
-        clean = text.replace("[OFF_TOPIC]", "").strip()
-        return True, clean
+        return True, text.replace("[OFF_TOPIC]", "").strip()
     return False, text
 
-# ── Photo utilities ───────────────────────────────────────────────────────────
 async def photo_to_base64(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> str:
-    photo = msg.photo[-1]
-    file  = await context.bot.get_file(photo.file_id)
-    data  = await file.download_as_bytearray()
+    file = await context.bot.get_file(msg.photo[-1].file_id)
+    data = await file.download_as_bytearray()
     return base64.standard_b64encode(data).decode()
 
-# ── Text utilities ────────────────────────────────────────────────────────────
 def strip_mention(text: str) -> str:
     if not BOT_USERNAME:
         return text.strip()
     return " ".join(p for p in text.split() if p.lower() != f"@{BOT_USERNAME}").strip()
 
-def is_group(update: Update) -> bool:
+def is_group_chat(update: Update) -> bool:
     return update.message.chat.type in ("group", "supergroup")
 
 def bot_mentioned(text: str) -> bool:
     return bool(BOT_USERNAME) and f"@{BOT_USERNAME}" in text.lower()
 
-# ── Command handlers ──────────────────────────────────────────────────────────
+def get_display_name(user) -> str:
+    return (user.username and f"@{user.username}") or user.full_name or "Unknown"
+
+# ── Commands ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "me"
     await update.message.reply_text(
         "Hello! I am your JEE Doubt Solver.\n\n"
-        "/solve <question> — Step-by-step solution\n"
-        "/hint <question> — A nudge, no full answer\n"
-        "/formula <topic> — Key formulas instantly\n"
-        "/motivate — Get a push to keep going\n"
-        "/tips — Study and stress tips\n"
-        "/about — What I can do\n"
-        "/clear — Fresh conversation start\n"
-        "/help — Show this guide\n\n"
-        "📸 Send an image of a question to solve it.\n"
-        "📸 Send an image with 'translate' to translate text.\n"
-        "📸 Send an image with 'who is this' to identify a person.\n\n"
-        f"In groups, tag {mention} with your question."
+        "=== DOUBT SOLVING ===\n"
+        "/solve <question>   — Step-by-step solution\n"
+        "/hint <question>    — A nudge, no full answer\n"
+        "/formula <topic>    — Key formulas instantly\n"
+        "/identify           — Identify anything in an image\n\n"
+        "=== QUIZ & STATS ===\n"
+        "/quiz               — Interactive JEE quiz\n"
+        "/stopquiz           — Cancel current quiz\n"
+        "/daily              — Today's challenge question\n"
+        "/leaderboard        — Top scorer rankings\n"
+        "/mystats            — Your personal stats\n"
+        "/rank               — Your leaderboard position\n\n"
+        "=== MOTIVATION ===\n"
+        "/motivate           — Push to keep going\n"
+        "/tips               — Study and stress tips\n\n"
+        "=== OTHER ===\n"
+        "/about              — Full feature list\n"
+        "/clear              — Fresh start\n"
+        "/help               — This guide\n\n"
+        "Send a photo of any question to solve it.\n"
+        "Add 'translate' in caption to translate it.\n\n"
+        f"In groups, tag {mention} with your message."
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_start(update, context)
 
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    history[update.effective_user.id].clear()
-    await update.message.reply_text("History cleared. Starting fresh!")
+async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "=== JEE Doubt Solver — Full Feature List ===\n\n"
+        "SOLVING\n"
+        "- Solve any JEE Physics, Chemistry, or Maths doubt\n"
+        "- Hints without revealing the full answer\n"
+        "- Solve questions directly from images\n"
+        "- Identify people, objects, diagrams in images\n"
+        "- Translate text in images to English\n"
+        "- Key formulas for any topic on demand\n\n"
+        "QUIZ SYSTEM\n"
+        "- Full interactive quiz with your choice of chapter and topic\n"
+        "- 1 to 50 questions per session\n"
+        "- Instant feedback + explanation after each answer\n"
+        "- Score, grade, and badge at the end\n"
+        "- Daily challenge question (changes every day)\n\n"
+        "STATS & RANKINGS\n"
+        "- Personal stats: accuracy, streak, best/worst chapter\n"
+        "- Leaderboard: top 10 ranked by best quiz score\n"
+        "- Your rank + gap to beat the person above you\n"
+        "- Study streak tracking (consecutive days of quizzes)\n"
+        "- Quiz history: last 10 sessions saved\n\n"
+        "EXTRAS\n"
+        "- Motivational quotes + study/stress tips\n"
+        "- Remembers last 12 messages for context\n"
+        "- Works in groups (tag the bot)\n\n"
+        "Just ask. I am always here."
+    )
 
-async def cmd_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id  = update.effective_user.id
-    question = " ".join(context.args).strip() if context.args else ""
-    if not question:
-        await update.message.reply_text("Usage: /hint <your question>")
-        return
-    raw = await ask(user_id, f"Give only a HINT (no solution) for:\n{question}")
-    off, clean = is_off_topic_response(raw)
-    if off:
-        await send_savage_reply(update.message, context)
-    else:
-        await update.message.reply_text(clean)
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    history[uid].clear()
+    identify_wait.discard(uid)
+    daily_wait.discard(uid)
+    quiz_setup.pop(uid, None)
+    active_quiz.pop(uid, None)
+    await update.message.reply_text("All cleared! Starting completely fresh.")
 
 async def cmd_solve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id  = update.effective_user.id
-    question = " ".join(context.args).strip() if context.args else ""
-    if not question:
+    uid = update.effective_user.id
+    q   = " ".join(context.args).strip() if context.args else ""
+    if not q:
         await update.message.reply_text("Usage: /solve <your question>")
         return
-    raw = await ask(user_id, f"Solve step by step:\n{question}")
-    off, clean = is_off_topic_response(raw)
-    if off:
-        await send_savage_reply(update.message, context)
-    else:
-        await update.message.reply_text(clean)
+    raw = await ask(uid, f"Solve step by step:\n{q}")
+    off, clean = is_off_topic(raw)
+    await (send_savage_reply(update.message, context) if off else update.message.reply_text(clean))
+
+async def cmd_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    q   = " ".join(context.args).strip() if context.args else ""
+    if not q:
+        await update.message.reply_text("Usage: /hint <your question>")
+        return
+    raw = await ask(uid, f"Give only a HINT (no solution) for:\n{q}")
+    off, clean = is_off_topic(raw)
+    await (send_savage_reply(update.message, context) if off else update.message.reply_text(clean))
 
 async def cmd_formula(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    topic   = " ".join(context.args).strip() if context.args else ""
+    uid   = update.effective_user.id
+    topic = " ".join(context.args).strip() if context.args else ""
     if not topic:
         await update.message.reply_text("Usage: /formula <topic>  e.g. /formula kinematics")
         return
-    raw = await ask(
-        user_id,
-        f"List the most important JEE formulas for '{topic}'. "
-        "Format: Name: formula. Plain text, no LaTeX."
-    )
-    off, clean = is_off_topic_response(raw)
-    if off:
-        await send_savage_reply(update.message, context)
-    else:
-        await update.message.reply_text(clean)
+    raw = await ask(uid, f"List the most important JEE formulas for '{topic}'. Format: Name: formula. Plain text, no LaTeX.")
+    off, clean = is_off_topic(raw)
+    await (send_savage_reply(update.message, context) if off else update.message.reply_text(clean))
 
 async def cmd_motivate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(random.choice(QUOTES))
@@ -341,38 +708,110 @@ async def cmd_motivate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(random.choice(TIPS))
 
-async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ── /identify ─────────────────────────────────────────────────────────────────
+async def cmd_identify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    identify_wait.add(update.effective_user.id)
     await update.message.reply_text(
-        "I am a JEE Doubt Solver bot — built to help you crack Physics, Chemistry, and Maths.\n\n"
-        "What I can do:\n"
-        "- Solve any JEE-level doubt instantly\n"
-        "- Give hints without revealing the full answer\n"
-        "- Read and solve questions from images 📸\n"
-        "- Translate text in images to English 🌐\n"
-        "- Identify famous scientists and personalities 🧑‍🔬\n"
-        "- Share key formulas for any topic\n"
-        "- Motivate you when you need a push\n"
-        "- Give study and stress management tips\n"
-        "- Roast you (lovingly) if you go off-topic 😄\n\n"
-        "I remember your last 12 messages so I can follow your train of thought.\n\n"
-        "Just ask your doubt — I am always here."
+        "Sure! Send me the image now.\n\n"
+        "I can identify:\n"
+        "- JEE questions and diagrams\n"
+        "- Famous scientists and personalities\n"
+        "- Scientific instruments and apparatus\n"
+        "- Graphs, charts, and data visuals\n"
+        "- Text, equations, or handwritten notes"
     )
 
-# ── Photo handler ─────────────────────────────────────────────────────────────
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg     = update.message
-    user_id = update.effective_user.id
-    caption = msg.caption or ""
+# ── /quiz ─────────────────────────────────────────────────────────────────────
+async def cmd_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if uid in active_quiz:
+        await update.message.reply_text(
+            "You already have an active quiz running!\n"
+            "Answer the current question or type /stopquiz to cancel."
+        )
+        return
+    quiz_setup[uid] = {"step": "num"}
+    await update.message.reply_text(
+        "=== JEE Quiz ===\n\n"
+        "How many questions would you like?\n"
+        "Enter a number from 1 to 50."
+    )
 
-    if is_group(update) and not bot_mentioned(caption):
+async def cmd_stopquiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    was = uid in active_quiz or uid in quiz_setup
+    active_quiz.pop(uid, None)
+    quiz_setup.pop(uid, None)
+    await update.message.reply_text(
+        "Quiz cancelled. Come back whenever you're ready!" if was
+        else "No active quiz to cancel."
+    )
+
+# ── /leaderboard ──────────────────────────────────────────────────────────────
+async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(build_leaderboard_text())
+
+# ── /mystats ──────────────────────────────────────────────────────────────────
+async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(build_mystats_text(update.effective_user.id))
+
+# ── /rank ─────────────────────────────────────────────────────────────────────
+async def cmd_rank(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await update.message.reply_text(build_rank_text(user.id, get_display_name(user)))
+
+# ── /daily ────────────────────────────────────────────────────────────────────
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    wait = await update.message.reply_text("Fetching today's challenge question...")
+
+    data = await get_or_generate_daily()
+    await wait.delete()
+
+    if not data or not data.get("question"):
+        await update.message.reply_text("Could not load today's question. Try again in a moment.")
         return
 
-    clean_caption  = strip_mention(caption).strip().lower()
-    translate_mode = "translate" in clean_caption
-    identify_mode  = any(k in clean_caption for k in ["who is", "who's", "identify", "person", "scientist"])
+    answered = str(uid) in data.get("answered_by", [])
+    q = data["question"]
 
-    thinking = await msg.reply_text("Reading your image... 👀")
+    if answered:
+        await update.message.reply_text(
+            f"You already answered today's challenge!\n\n"
+            f"Chapter: {data['chapter']} — {data['topic']}\n\n"
+            f"{q['q']}\n\n"
+            f"A)  {q['A']}\nB)  {q['B']}\nC)  {q['C']}\nD)  {q['D']}\n\n"
+            f"Correct answer: {q['ans']}\n"
+            f"Explanation: {q['exp']}\n\n"
+            "Come back tomorrow for a new one!"
+        )
+        return
 
+    daily_wait.add(uid)
+    await update.message.reply_text(
+        f"=== Daily Challenge — {TODAY_LABEL()} ===\n\n"
+        f"Chapter: {data['chapter']} — {data['topic']}\n\n"
+        f"{q['q']}\n\n"
+        f"A)  {q['A']}\nB)  {q['B']}\nC)  {q['C']}\nD)  {q['D']}\n\n"
+        "Reply with A, B, C, or D"
+    )
+
+# ── Photo handler ──────────────────────────────────────────────────────────────
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg     = update.message
+    uid     = update.effective_user.id
+    caption = msg.caption or ""
+
+    if is_group_chat(update) and not bot_mentioned(caption):
+        return
+
+    clean_cap      = strip_mention(caption).strip().lower()
+    translate_mode = "translate" in clean_cap
+    is_identify    = uid in identify_wait or any(k in clean_cap for k in [
+        "identify", "who is", "who's", "what is this", "what's this",
+    ])
+
+    thinking = await msg.reply_text("Reading your image, please wait...")
     try:
         b64 = await photo_to_base64(msg, context)
 
@@ -380,44 +819,44 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             instruction = (
                 "Extract all text from this image exactly as written, "
                 "then provide a clear English translation. "
-                "Show original first, then translation."
+                "Show original first, then translation below it."
             )
-        elif identify_mode:
+        elif is_identify:
+            identify_wait.discard(uid)
             instruction = (
-                "Look at this image carefully. Identify who this person is. "
-                "If it is a famous scientist, mathematician, historical figure, or public personality, "
-                "tell their name, what they are famous for, and one interesting fact about them. "
-                "Keep it concise — 4-5 lines maximum. "
-                "If you cannot identify the person, say so honestly."
+                "Look at this image carefully and identify everything in it.\n"
+                "If it contains a person: name them, state what they are famous for, and one interesting fact.\n"
+                "If it contains a scientific instrument: name it and explain its use.\n"
+                "If it contains a graph or diagram: describe what it shows.\n"
+                "If it contains a JEE question or equation: identify the topic and concept.\n"
+                "If it contains a scene or object: describe it clearly.\n"
+                "Be concise — max 6 lines. If you cannot identify something, say so honestly."
             )
         else:
             extra = f" Student note: {strip_mention(caption)}" if caption.strip() else ""
             instruction = (
-                "This is a JEE student's image — it may contain a question, diagram, or text. "
-                "Identify what is asked and solve it step by step. "
-                "Formulas in plain text only. Keep it concise and clear." + extra
+                "This is a JEE student's image. It likely contains a question, diagram, or problem. "
+                "Identify what is being asked and solve it step by step. "
+                "Write all formulas in plain text. Be concise and precise." + extra
             )
 
         reply = await ask_vision(instruction, b64)
-
     except Exception as e:
         logger.error("Photo handler error: %s", e)
         reply = "I had trouble reading the image. Please try again."
 
     await thinking.delete()
-    off, clean = is_off_topic_response(reply)
-    if off:
-        await send_savage_reply(msg, context)
-    else:
-        await msg.reply_text(clean)
+    off, clean = is_off_topic(reply)
+    await (send_savage_reply(msg, context) if off else msg.reply_text(clean))
 
-# ── Text message handler ──────────────────────────────────────────────────────
+# ── Text handler ───────────────────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg     = update.message
-    text    = msg.text or ""
-    user_id = update.effective_user.id
+    msg      = update.message
+    text     = (msg.text or "").strip()
+    uid      = update.effective_user.id
+    user     = update.effective_user
 
-    if is_group(update) and not bot_mentioned(text):
+    if is_group_chat(update) and not bot_mentioned(text):
         return
 
     question = strip_mention(text).strip()
@@ -425,39 +864,196 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("Ask me any JEE doubt!")
         return
 
-    if "hint" in question.lower():
-        prompt = f"Give only a HINT (no solution) for: {question}"
-    else:
-        prompt = question
+    # ── Daily answer ──────────────────────────────────────────────────────────
+    if uid in daily_wait:
+        ans = question.strip().upper()
+        if ans not in ("A", "B", "C", "D"):
+            await msg.reply_text("Please reply with A, B, C, or D for the daily challenge.")
+            return
+        data = load_daily()
+        q    = data.get("question")
+        if not q:
+            daily_wait.discard(uid)
+            await msg.reply_text("Daily question not found. Type /daily to try again.")
+            return
 
-    raw = await ask(user_id, prompt)
-    off, clean = is_off_topic_response(raw)
+        correct  = q["ans"]
+        is_right = ans == correct
+        daily_wait.discard(uid)
+        record_daily_answer(uid)
 
-    kwargs = {"reply_to_message_id": msg.message_id} if is_group(update) else {}
+        if is_right:
+            await msg.reply_text(
+                f"Correct! Well done!\n\n"
+                f"Explanation: {q['exp']}\n\n"
+                "Come back tomorrow for a new challenge!"
+            )
+        else:
+            await msg.reply_text(
+                f"Incorrect. The correct answer is {correct}.\n\n"
+                f"Explanation: {q['exp']}\n\n"
+                "Better luck tomorrow! Type /quiz to practice more."
+            )
+        return
 
-    if off:
-        await send_savage_reply(msg, context)
-    else:
-        await msg.reply_text(clean, **kwargs)
+    # ── Quiz setup flow ───────────────────────────────────────────────────────
+    if uid in quiz_setup:
+        setup = quiz_setup[uid]
+        step  = setup["step"]
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+        if step == "num":
+            if not question.isdigit() or not (1 <= int(question) <= 50):
+                await msg.reply_text("Please enter a number between 1 and 50.")
+                return
+            setup["num"]  = int(question)
+            setup["step"] = "chapter"
+            await msg.reply_text(
+                f"Great — {setup['num']} question(s) it is!\n\n"
+                "Which chapter?\n"
+                "(e.g. Kinematics, Thermodynamics, Organic Chemistry, Matrices)"
+            )
+            return
+
+        if step == "chapter":
+            setup["chapter"] = question
+            setup["step"]    = "topic"
+            await msg.reply_text(
+                f"Chapter: {setup['chapter']}\n\n"
+                "Now the specific topic within this chapter.\n"
+                "Be precise for the best questions.\n"
+                "(e.g. Projectile Motion, Nernst Equation, Integration by Parts)"
+            )
+            return
+
+        if step == "topic":
+            setup["topic"] = question
+            num     = setup["num"]
+            chapter = setup["chapter"]
+            topic   = setup["topic"]
+            quiz_setup.pop(uid, None)
+
+            wait_msg = await msg.reply_text(
+                f"Generating {num} JEE-level question(s)...\n\n"
+                f"Chapter : {chapter}\n"
+                f"Topic   : {topic}\n\n"
+                "Please wait..."
+            )
+            questions = await generate_quiz_questions(num, chapter, topic)
+
+            if not questions:
+                await wait_msg.delete()
+                await msg.reply_text(
+                    "Could not generate questions for this topic. "
+                    "Try a more specific topic or a different chapter."
+                )
+                return
+
+            actual = len(questions)
+            active_quiz[uid] = {
+                "questions": questions, "current": 0, "score": 0,
+                "total": actual, "chapter": chapter, "topic": topic,
+            }
+            await wait_msg.delete()
+            await msg.reply_text(
+                f"=== Quiz Ready! ===\n\n"
+                f"Chapter  : {chapter}\n"
+                f"Topic    : {topic}\n"
+                f"Questions: {actual}\n\n"
+                "Answer each question with A, B, C, or D.\n"
+                "Type /stopquiz at any time to cancel.\n\n"
+                "Let's go!"
+            )
+            await msg.reply_text(format_question(questions[0], 1, actual))
+            return
+
+    # ── Quiz answer flow ──────────────────────────────────────────────────────
+    if uid in active_quiz:
+        quiz = active_quiz[uid]
+        ans  = question.strip().upper()
+
+        if ans not in ("A", "B", "C", "D"):
+            await msg.reply_text("Please reply with A, B, C, or D.")
+            return
+
+        current_q = quiz["questions"][quiz["current"]]
+        correct   = current_q["ans"]
+        is_right  = ans == correct
+
+        if is_right:
+            quiz["score"] += 1
+
+        feedback = (
+            f"{'Correct!' if is_right else f'Incorrect. Answer is {correct}.'}\n"
+            f"Explanation: {current_q['exp']}\n\n"
+            f"Score: {quiz['score']}/{quiz['current'] + 1}"
+        )
+        await msg.reply_text(feedback)
+        quiz["current"] += 1
+
+        if quiz["current"] >= quiz["total"]:
+            result = quiz_result_text(quiz["score"], quiz["total"], quiz["chapter"], quiz["topic"])
+            record_quiz_score(uid, get_display_name(user), quiz["score"], quiz["total"], quiz["chapter"], quiz["topic"])
+            active_quiz.pop(uid, None)
+            await msg.reply_text(result)
+        else:
+            await msg.reply_text(format_question(quiz["questions"][quiz["current"]], quiz["current"] + 1, quiz["total"]))
+        return
+
+    # ── Normal doubt solving ──────────────────────────────────────────────────
+    prompt = f"Give only a HINT (no solution) for: {question}" if "hint" in question.lower() else question
+    raw    = await ask(uid, prompt)
+    off, clean = is_off_topic(raw)
+    kwargs = {"reply_to_message_id": msg.message_id} if is_group_chat(update) else {}
+    await (send_savage_reply(msg, context) if off else msg.reply_text(clean, **kwargs))
+
+# ── Register commands with Telegram ───────────────────────────────────────────
+async def post_init(app) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start",       "Welcome and usage guide"),
+        BotCommand("help",        "Show all commands"),
+        BotCommand("about",       "Full feature list"),
+        BotCommand("solve",       "Step-by-step solution"),
+        BotCommand("hint",        "Hint only — no full answer"),
+        BotCommand("formula",     "Key formulas for any topic"),
+        BotCommand("identify",    "Identify anything in an image"),
+        BotCommand("quiz",        "Take an interactive JEE quiz"),
+        BotCommand("stopquiz",    "Cancel the current quiz"),
+        BotCommand("daily",       "Today's daily challenge question"),
+        BotCommand("leaderboard", "Top quiz score rankings"),
+        BotCommand("mystats",     "Your personal quiz stats"),
+        BotCommand("rank",        "Your position on the leaderboard"),
+        BotCommand("motivate",    "Get a motivational quote"),
+        BotCommand("tips",        "Study and stress management tips"),
+        BotCommand("clear",       "Reset conversation and quiz state"),
+    ])
+    logger.info("Commands registered with Telegram")
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 def main() -> None:
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    logger.info("Starting JEE Doubt Solver bot...")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("hint", cmd_hint))
-    app.add_handler(CommandHandler("solve", cmd_solve))
-    app.add_handler(CommandHandler("formula", cmd_formula))
-    app.add_handler(CommandHandler("motivate", cmd_motivate))
-    app.add_handler(CommandHandler("tips", cmd_tips))
-    app.add_handler(CommandHandler("about", cmd_about))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("about",       cmd_about))
+    app.add_handler(CommandHandler("clear",       cmd_clear))
+    app.add_handler(CommandHandler("solve",       cmd_solve))
+    app.add_handler(CommandHandler("hint",        cmd_hint))
+    app.add_handler(CommandHandler("formula",     cmd_formula))
+    app.add_handler(CommandHandler("identify",    cmd_identify))
+    app.add_handler(CommandHandler("quiz",        cmd_quiz))
+    app.add_handler(CommandHandler("stopquiz",    cmd_stopquiz))
+    app.add_handler(CommandHandler("daily",       cmd_daily))
+    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
+    app.add_handler(CommandHandler("mystats",     cmd_mystats))
+    app.add_handler(CommandHandler("rank",        cmd_rank))
+    app.add_handler(CommandHandler("motivate",    cmd_motivate))
+    app.add_handler(CommandHandler("tips",        cmd_tips))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Bot started successfully!")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot is polling for updates...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
