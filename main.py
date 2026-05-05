@@ -386,4 +386,77 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elif identify_mode:
             instruction = (
                 "Look at this image carefully. Identify who this person is. "
-                "If
+                "If it is a famous scientist, mathematician, historical figure, or public personality, "
+                "tell their name, what they are famous for, and one interesting fact about them. "
+                "Keep it concise — 4-5 lines maximum. "
+                "If you cannot identify the person, say so honestly."
+            )
+        else:
+            extra = f" Student note: {strip_mention(caption)}" if caption.strip() else ""
+            instruction = (
+                "This is a JEE student's image — it may contain a question, diagram, or text. "
+                "Identify what is asked and solve it step by step. "
+                "Formulas in plain text only. Keep it concise and clear." + extra
+            )
+
+        reply = await ask_vision(instruction, b64)
+
+    except Exception as e:
+        logger.error("Photo handler error: %s", e)
+        reply = "I had trouble reading the image. Please try again."
+
+    await thinking.delete()
+    off, clean = is_off_topic_response(reply)
+    if off:
+        await send_savage_reply(msg, context)
+    else:
+        await msg.reply_text(clean)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg     = update.message
+    text    = msg.text or ""
+    user_id = update.effective_user.id
+
+    if is_group(update) and not bot_mentioned(text):
+        return
+
+    question = strip_mention(text).strip()
+    if not question:
+        await msg.reply_text("Ask me any JEE doubt!")
+        return
+
+    if "hint" in question.lower():
+        prompt = f"Give only a HINT (no solution) for: {question}"
+    else:
+        prompt = question
+
+    raw = await ask(user_id, prompt)
+    off, clean = is_off_topic_response(raw)
+
+    kwargs = {"reply_to_message_id": msg.message_id} if is_group(update) else {}
+
+    if off:
+        await send_savage_reply(msg, context)
+    else:
+        await msg.reply_text(clean, **kwargs)
+
+def main() -> None:
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("hint", cmd_hint))
+    app.add_handler(CommandHandler("solve", cmd_solve))
+    app.add_handler(CommandHandler("formula", cmd_formula))
+    app.add_handler(CommandHandler("motivate", cmd_motivate))
+    app.add_handler(CommandHandler("tips", cmd_tips))
+    app.add_handler(CommandHandler("about", cmd_about))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("Bot started successfully!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
