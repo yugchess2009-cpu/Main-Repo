@@ -54,7 +54,8 @@ BOT_ID: int       = 0    # numeric Telegram user ID of the bot
 MEME_PATH        = os.path.join(BASE_DIR, "assets", "padhai_meme.jpg")
 LEADERBOARD_FILE = os.path.join(BASE_DIR, "leaderboard.json")
 DAILY_FILE       = os.path.join(BASE_DIR, "daily_question.json")
-
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
+OWNER_ID   = 8334633375
 text_client   = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 vision_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
@@ -378,7 +379,46 @@ def build_rank_text(uid: int, name: str) -> str:
     overall = round(me["total_correct"] / me["total_questions"] * 100, 1) if me.get("total_questions") else 0
     lines.append(f"\nYour best: {me['best_pct']}%  |  Overall: {overall}%\nType /quiz to improve your rank!")
     return "\n\n".join(lines)
+def load_users() -> dict:
+    try:
+        with open(USERS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
+def save_users(users: dict) -> None:
+    try:
+        with open(USERS_FILE, "w") as f:
+            json.dump(users, f, indent=2)
+    except Exception as e:
+        logger.error("Users save error: %s", e)
+
+def track_user(user) -> None:
+    users = load_users()
+    uid = str(user.id)
+    users[uid] = {
+        "id": user.id,
+        "name": user.full_name or "Unknown",
+        "username": user.username or "",
+        "last_seen": datetime.now().strftime("%d %b %Y %H:%M"),
+    }
+    save_users(users)
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("This command is only for the bot owner.")
+        return
+    users = load_users()
+    if not users:
+        await update.message.reply_text("No users yet.")
+        return
+    lines = [f"=== Bot Users ({len(users)}) ==="]
+    for u in users.values():
+        uname = f"@{u['username']}" if u["username"] else "no username"
+        lines.append(f"\n{u['name']} ({uname})\nID: {u['id']}\nLast seen: {u['last_seen']}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i+4000])
 # ── Daily question persistence ─────────────────────────────────────────────────
 def load_daily() -> dict:
     try:
@@ -1035,6 +1075,7 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg     = update.message
     uid     = update.effective_user.id
+    track_user(update.effective_user)
     caption = msg.caption or ""
 
     if is_group_chat(update) and not should_respond_in_group(update, caption):
@@ -1099,7 +1140,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text     = (msg.text or "").strip()
     uid      = update.effective_user.id
     user     = update.effective_user
-
+    track_user(user)
     if is_group_chat(update) and not should_respond_in_group(update, text):
         return
 
@@ -1376,6 +1417,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tips",            cmd_tips))
     app.add_handler(CommandHandler("challenge",       cmd_challenge))
     app.add_handler(CommandHandler("cancelchallenge", cmd_cancelchallenge))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(handle_duel_callback, pattern=r"^duel_(accept|decline):"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
