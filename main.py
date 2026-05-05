@@ -15,13 +15,9 @@ import os
 import base64
 import random
 import logging
-import os
-import base64
-import random
-import logging
 from collections import defaultdict
 from openai import AsyncOpenAI
-from telegram import Update, Message, BotCommand, InputFile
+from telegram import Update, Message, InputFile
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -39,12 +35,14 @@ logger = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_BASE_URL = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
-OPENAI_API_KEY  = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY", "dummy")
+OPENAI_API_KEY  = os.environ.get("GROQ_API_KEY", "dummy")
 BOT_USERNAME    = os.environ.get("BOT_USERNAME", "").lower()
 MEME_PATH       = os.path.join(os.path.dirname(__file__), "assets", "padhai_meme.jpg")
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+openai_client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a warm, sharp JEE tutor — like a caring elder sibling who wants you to succeed.
@@ -179,7 +177,7 @@ QUOTES = [
 MAX_HISTORY = 12
 history: dict[int, list[dict]] = defaultdict(list)
 
-def build_messages(user_id: int, content: str | list) -> list[dict]:
+def build_messages(user_id: int, content) -> list[dict]:
     hist = history[user_id]
     hist.append({"role": "user", "content": content})
     if len(hist) > MAX_HISTORY * 2:
@@ -189,20 +187,20 @@ def build_messages(user_id: int, content: str | list) -> list[dict]:
 def record_reply(user_id: int, reply: str) -> None:
     history[user_id].append({"role": "assistant", "content": reply})
 
-# ── OpenAI call ───────────────────────────────────────────────────────────────
-async def ask(user_id: int, content: str | list) -> str:
+# ── Groq/OpenAI call ───────────────────────────────────────────────────────────
+async def ask(user_id: int, content) -> str:
     messages = build_messages(user_id, content)
     try:
         resp = await openai_client.chat.completions.create(
-            model="gpt-5.1",
-            max_completion_tokens=500,
+            model="llama-3.3-70b-versatile",
+            max_tokens=500,
             messages=messages,
         )
         reply = resp.choices[0].message.content or "Could not generate a response. Please try again."
         record_reply(user_id, reply)
         return reply
     except Exception as e:
-        logger.error("OpenAI error: %s", e)
+        logger.error("Groq error: %s", e)
         return "Something went wrong. Please try again in a moment."
 
 # ── Off-topic handler: savage reply + meme ────────────────────────────────────
@@ -394,33 +392,4 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         prompt = question
 
-    raw = await ask(user_id, prompt)
-    off, clean = is_off_topic_response(raw)
-
-    kwargs = {"reply_to_message_id": msg.message_id} if is_group(update) else {}
-
-    if off:
-        await send_savage_reply(msg, context)
-    else:
-        await msg.reply_text(clean, **kwargs)
-
-# ── Startup: register commands ────────────────────────────────────
-def main() -> None:
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("hint", cmd_hint))
-    app.add_handler(CommandHandler("solve", cmd_solve))
-    app.add_handler(CommandHandler("formula", cmd_formula))
-    app.add_handler(CommandHandler("motivate", cmd_motivate))
-    app.add_handler(CommandHandler("tips", cmd_tips))
-    app.add_handler(CommandHandler("about", cmd_about))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+    raw = await ask(user_id, pr
