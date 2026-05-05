@@ -405,3 +405,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text(clean, **kwargs)
 
 # ── Startup: register commands ────────────────────────────────────
+def main() -> None:
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("hint", cmd_hint))
+    app.add_handler(CommandHandler("solve", cmd_solve))
+    app.add_handler(CommandHandler("formula", cmd_formula))
+    app.add_handler(CommandHandler("motivate", cmd_motivate))
+    app.add_handler(CommandHandler("tips", cmd_tips))
+    app.add_handler(CommandHandler("about", cmd_about))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
