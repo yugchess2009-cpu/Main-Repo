@@ -392,4 +392,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         prompt = question
 
-    raw = await ask(user_id, pr
+    raw = await ask(user_id, prompt)
+    off, clean = is_off_topic_response(raw)
+
+    kwargs = {"reply_to_message_id": msg.message_id} if is_group(update) else {}
+
+    if off:
+        await send_savage_reply(msg, context)
+    else:
+        await msg.reply_text(clean, **kwargs)
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+def main() -> None:
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("hint", cmd_hint))
+    app.add_handler(CommandHandler("solve", cmd_solve))
+    app.add_handler(CommandHandler("formula", cmd_formula))
+    app.add_handler(CommandHandler("motivate", cmd_motivate))
+    app.add_handler(CommandHandler("tips", cmd_tips))
+    app.add_handler(CommandHandler("about", cmd_about))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("Bot started!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
