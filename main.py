@@ -1,3 +1,4 @@
+Content is user-generated and unverified.
 import threading
 import re
 import json
@@ -510,44 +511,87 @@ async def ask_vision(instruction: str, b64: str, max_tok: int = 700) -> str:
 async def generate_quiz_questions(num: int, chapter: str, topic: str) -> list[dict] | None:
     prompt = (
         f"Generate exactly {num} JEE Advanced level multiple choice questions "
-        f"on the topic '{topic}' from the chapter '{chapter}'.\n\n"
-        "Format each question EXACTLY like this:\n"
-        "QUESTION: [full question with any numbers/scenarios]\n"
-        "A: [option A]\nB: [option B]\nC: [option C]\nD: [option D]\n"
-        "ANSWER: [A/B/C/D]\nEXPLANATION: [one concise line — why this answer is correct]\n"
+        f"on '{topic}' from '{chapter}'.\n\n"
+        "Use this EXACT format for EVERY question, no deviations:\n\n"
+        "QUESTION: [full question text here]\n"
+        "A: [option A]\n"
+        "B: [option B]\n"
+        "C: [option C]\n"
+        "D: [option D]\n"
+        "ANSWER: [single letter A, B, C, or D only]\n"
+        "EXPLANATION: [one concise line explaining why]\n"
         "###\n\n"
-        "Rules:\n"
-        "- JEE Advanced difficulty — tricky, conceptual, and numerical\n"
-        "- All 4 options must be plausible and similar to confuse test-takers\n"
-        "- No LaTeX — plain text formulas only (e.g. F = ma)\n"
-        "- No repetition between questions\n"
-        f"- Generate exactly {num} questions, no more, no less"
+        "Important rules:\n"
+        "- Use plain text formulas only, no LaTeX or symbols like \\frac\n"
+        "- All 4 options must be plausible\n"
+        "- ANSWER must be exactly one letter: A, B, C, or D\n"
+        "- End every question with ###\n"
+        f"- Generate exactly {num} questions"
     )
-    max_tok = min(num * 220 + 500, 8000)
+    max_tok = min(num * 250 + 500, 8000)
     try:
         resp = await text_client.chat.completions.create(
             model=TEXT_MODEL, max_tokens=max_tok,
             messages=[{"role": "user", "content": prompt}],
         )
-        return parse_questions(resp.choices[0].message.content or "")
+        raw = resp.choices[0].message.content or ""
+        logger.info("Quiz raw response (first 300 chars): %s", raw[:300])
+        result = parse_questions(raw)
+        logger.info("Parsed %d questions from quiz response", len(result))
+        return result if result else None
     except Exception as e:
         logger.error("Quiz generation error: %s", e)
         return None
 
 def parse_questions(raw: str) -> list[dict]:
     questions = []
-    for block in [b.strip() for b in raw.split("###") if b.strip()]:
+    # Split by ### or by numbered question patterns
+    blocks = [b.strip() for b in re.split(r"###|\n(?=Q\d+[\).])", raw) if b.strip()]
+    for block in blocks:
         q: dict = {}
-        for line in block.splitlines():
-            line = line.strip()
-            if line.startswith("QUESTION:"):   q["q"]   = line[9:].strip()
-            elif line.startswith("A:"):        q["A"]   = line[2:].strip()
-            elif line.startswith("B:"):        q["B"]   = line[2:].strip()
-            elif line.startswith("C:"):        q["C"]   = line[2:].strip()
-            elif line.startswith("D:"):        q["D"]   = line[2:].strip()
-            elif line.startswith("ANSWER:"):   q["ans"] = line[7:].strip().upper()
-            elif line.startswith("EXPLANATION:"): q["exp"] = line[12:].strip()
-        if all(k in q for k in ("q", "A", "B", "C", "D", "ans", "exp")):
+        lines = block.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+            upper = line.upper()
+            # Question line
+            if upper.startswith("QUESTION:"):
+                text = line[9:].strip()
+                # collect continuation lines until next key
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i].strip()
+                    if re.match(r"^(A|B|C|D|ANSWER|EXPLANATION)\s*:", nxt, re.IGNORECASE):
+                        break
+                    text += " " + nxt
+                    i += 1
+                q["q"] = text.strip()
+                continue
+            # Options A B C D
+            m = re.match(r"^([ABCD])\s*[:.)\-]\s*(.+)", line, re.IGNORECASE)
+            if m:
+                q[m.group(1).upper()] = m.group(2).strip()
+                i += 1
+                continue
+            # Answer
+            if upper.startswith("ANSWER:"):
+                ans = line[7:].strip().upper()
+                q["ans"] = ans[0] if ans else ""
+                i += 1
+                continue
+            # Explanation
+            if upper.startswith("EXPLANATION:"):
+                q["exp"] = line[12:].strip()
+                i += 1
+                continue
+            i += 1
+        # Fill missing explanation
+        if "exp" not in q:
+            q["exp"] = "Review this concept carefully."
+        if all(k in q for k in ("q", "A", "B", "C", "D", "ans")) and q["ans"] in ("A","B","C","D"):
             questions.append(q)
     return questions
 
@@ -1016,13 +1060,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elif is_identify:
             identify_wait.discard(uid)
             instruction = (
-                "Look at this image carefully and identify everything in it.\n"
-                "If it contains a person: name them, state what they are famous for, and one interesting fact.\n"
-                "If it contains a scientific instrument: name it and explain its use.\n"
-                "If it contains a graph or diagram: describe what it shows.\n"
-                "If it contains a JEE question or equation: identify the topic and concept.\n"
-                "If it contains a scene or object: describe it clearly.\n"
-                "Be concise — max 6 lines. If you cannot identify something, say so honestly."
+                "You are an expert image analyst. Carefully examine this image and identify everything in it.\n\n"
+                "If there is a PERSON in the image:\n"
+                "- State their full name confidently if you recognize them\n"
+                "- What are they famous for?\n"
+                "- One interesting fact about them\n"
+                "- Their field (scientist, politician, athlete, etc.)\n\n"
+                "If there is a SCIENTIFIC INSTRUMENT or APPARATUS:\n"
+                "- Name it precisely\n"
+                "- What is it used for?\n\n"
+                "If there is a GRAPH, DIAGRAM or CHART:\n"
+                "- What does it show?\n"
+                "- What are the key takeaways?\n\n"
+                "If there is a JEE QUESTION or EQUATION:\n"
+                "- Identify the topic and concept\n"
+                "- Solve it step by step\n\n"
+                "Be direct and confident. Max 8 lines. If you genuinely cannot identify something, say so honestly."
             )
         else:
             extra = f" Student note: {strip_mention(caption)}" if caption.strip() else ""
