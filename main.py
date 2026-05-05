@@ -17,7 +17,7 @@ import random
 import logging
 from collections import defaultdict
 from openai import AsyncOpenAI
-from telegram import Update, Message, InputFile
+from telegram import Update, Message
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -34,15 +34,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_API_KEY  = os.environ.get("GROQ_API_KEY", "dummy")
-BOT_USERNAME    = os.environ.get("BOT_USERNAME", "").lower()
-MEME_PATH       = os.path.join(os.path.dirname(__file__), "assets", "padhai_meme.jpg")
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "dummy")
+BOT_USERNAME   = os.environ.get("BOT_USERNAME", "").lower()
+MEME_PATH      = os.path.join(os.path.dirname(__file__), "assets", "padhai_meme.jpg")
 
-openai_client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
+# Two clients — one for text, one for vision
+text_client = AsyncOpenAI(
+    api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1"
 )
+vision_client = AsyncOpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
+
+TEXT_MODEL   = "llama-3.3-70b-versatile"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a warm, sharp JEE tutor — like a caring elder sibling who wants you to succeed.
@@ -187,12 +195,12 @@ def build_messages(user_id: int, content) -> list[dict]:
 def record_reply(user_id: int, reply: str) -> None:
     history[user_id].append({"role": "assistant", "content": reply})
 
-# ── Groq/OpenAI call ───────────────────────────────────────────────────────────
+# ── Text AI call ──────────────────────────────────────────────────────────────
 async def ask(user_id: int, content) -> str:
     messages = build_messages(user_id, content)
     try:
-        resp = await openai_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        resp = await text_client.chat.completions.create(
+            model=TEXT_MODEL,
             max_tokens=500,
             messages=messages,
         )
@@ -203,7 +211,28 @@ async def ask(user_id: int, content) -> str:
         logger.error("Groq error: %s", e)
         return "Something went wrong. Please try again in a moment."
 
-# ── Off-topic handler: savage reply + meme ────────────────────────────────────
+# ── Vision AI call ────────────────────────────────────────────────────────────
+async def ask_vision(instruction: str, b64: str) -> str:
+    try:
+        resp = await vision_client.chat.completions.create(
+            model=VISION_MODEL,
+            max_tokens=700,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ],
+                }
+            ],
+        )
+        return resp.choices[0].message.content or "Could not read the image. Please try again."
+    except Exception as e:
+        logger.error("Vision error: %s", e)
+        return "I had trouble reading the image. Please try again."
+
+# ── Off-topic handler ─────────────────────────────────────────────────────────
 async def send_savage_reply(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
     savage = random.choice(SAVAGE_REPLIES)
     await msg.reply_text(savage)
@@ -219,14 +248,14 @@ def is_off_topic_response(text: str) -> tuple[bool, str]:
         return True, clean
     return False, text
 
-# ── Photo utilities ────────────────────────────────────────────────────────────
+# ── Photo utilities ───────────────────────────────────────────────────────────
 async def photo_to_base64(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> str:
     photo = msg.photo[-1]
     file  = await context.bot.get_file(photo.file_id)
     data  = await file.download_as_bytearray()
     return base64.standard_b64encode(data).decode()
 
-# ── Text utilities ─────────────────────────────────────────────────────────────
+# ── Text utilities ────────────────────────────────────────────────────────────
 def strip_mention(text: str) -> str:
     if not BOT_USERNAME:
         return text.strip()
@@ -247,10 +276,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/hint <question> — A nudge, no full answer\n"
         "/formula <topic> — Key formulas instantly\n"
         "/motivate — Get a push to keep going\n"
+        "/tips — Study and stress tips\n"
+        "/about — What I can do\n"
         "/clear — Fresh conversation start\n"
         "/help — Show this guide\n\n"
-        "Send an image of a question to solve it.\n"
-        "Send an image with 'translate' in caption to translate.\n\n"
+        "📸 Send an image of a question to solve it.\n"
+        "📸 Send an image with 'translate' to translate text.\n"
+        "📸 Send an image with 'who is this' to identify a person.\n\n"
         f"In groups, tag {mention} with your question."
     )
 
@@ -316,12 +348,13 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "What I can do:\n"
         "- Solve any JEE-level doubt instantly\n"
         "- Give hints without revealing the full answer\n"
-        "- Read and solve questions from images\n"
-        "- Translate text in images to English\n"
+        "- Read and solve questions from images 📸\n"
+        "- Translate text in images to English 🌐\n"
+        "- Identify famous scientists and personalities 🧑‍🔬\n"
         "- Share key formulas for any topic\n"
         "- Motivate you when you need a push\n"
         "- Give study and stress management tips\n"
-        "- Roast you (lovingly) if you go off-topic\n\n"
+        "- Roast you (lovingly) if you go off-topic 😄\n\n"
         "I remember your last 12 messages so I can follow your train of thought.\n\n"
         "Just ask your doubt — I am always here."
     )
@@ -337,8 +370,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     clean_caption  = strip_mention(caption).strip().lower()
     translate_mode = "translate" in clean_caption
+    identify_mode  = any(k in clean_caption for k in ["who is", "who's", "identify", "person", "scientist"])
 
-    thinking = await msg.reply_text("Reading your image...")
+    thinking = await msg.reply_text("Reading your image... 👀")
 
     try:
         b64 = await photo_to_base64(msg, context)
@@ -349,77 +383,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "then provide a clear English translation. "
                 "Show original first, then translation."
             )
-        else:
-            extra = f" Student note: {strip_mention(caption)}" if caption.strip() else ""
+        elif identify_mode:
             instruction = (
-                "This is a JEE student's image — it may contain a question or diagram. "
-                "Identify what is asked and solve step by step. "
-                "Formulas in plain text. Keep it concise." + extra
-            )
-
-        content = [
-            {"type": "text", "text": instruction},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-        ]
-        raw = await ask(user_id, content)
-    except Exception as e:
-        logger.error("Photo handler error: %s", e)
-        raw = "I had trouble reading the image. Please try again."
-
-    await thinking.delete()
-    off, clean = is_off_topic_response(raw)
-    if off:
-        await send_savage_reply(msg, context)
-    else:
-        await msg.reply_text(clean)
-
-# ── Text message handler ──────────────────────────────────────────────────────
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg     = update.message
-    text    = msg.text or ""
-    user_id = update.effective_user.id
-
-    if is_group(update) and not bot_mentioned(text):
-        return
-
-    question = strip_mention(text).strip()
-    if not question:
-        await msg.reply_text("Ask me any JEE doubt!")
-        return
-
-    if "hint" in question.lower():
-        prompt = f"Give only a HINT (no solution) for: {question}"
-    else:
-        prompt = question
-
-    raw = await ask(user_id, prompt)
-    off, clean = is_off_topic_response(raw)
-
-    kwargs = {"reply_to_message_id": msg.message_id} if is_group(update) else {}
-
-    if off:
-        await send_savage_reply(msg, context)
-    else:
-        await msg.reply_text(clean, **kwargs)
-
-# ── Startup ───────────────────────────────────────────────────────────────────
-def main() -> None:
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("hint", cmd_hint))
-    app.add_handler(CommandHandler("solve", cmd_solve))
-    app.add_handler(CommandHandler("formula", cmd_formula))
-    app.add_handler(CommandHandler("motivate", cmd_motivate))
-    app.add_handler(CommandHandler("tips", cmd_tips))
-    app.add_handler(CommandHandler("about", cmd_about))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    logger.info("Bot started!")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+                "Look at this image carefully. Identify who this person is. "
+                "If
