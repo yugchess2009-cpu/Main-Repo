@@ -24,9 +24,11 @@ import random
 import logging
 from collections import defaultdict
 from openai import AsyncOpenAI
-from telegram import Update, Message, BotCommand
+import uuid
+from telegram import Update, Message, BotCommand, MessageEntity, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -43,8 +45,12 @@ logger = logging.getLogger(__name__)
 # ── Environment ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "dummy")
-BOT_USERNAME     = os.environ.get("BOT_USERNAME", "").lower()
 BASE_DIR         = os.path.dirname(__file__)
+
+# Auto-populated in post_init via get_me() — never read from env
+BOT_USERNAME: str = ""   # e.g. "yugjeebot"  (no @)
+BOT_NAME: str     = ""   # e.g. "Helper"
+BOT_ID: int       = 0    # numeric Telegram user ID of the bot
 MEME_PATH        = os.path.join(BASE_DIR, "assets", "padhai_meme.jpg")
 LEADERBOARD_FILE = os.path.join(BASE_DIR, "leaderboard.json")
 DAILY_FILE       = os.path.join(BASE_DIR, "daily_question.json")
@@ -455,7 +461,12 @@ history: dict[int, list[dict]]  = defaultdict(list)
 identify_wait: set[int]         = set()
 quiz_setup: dict[int, dict]     = {}
 active_quiz: dict[int, dict]    = {}
-daily_wait: set[int]            = set()  # users who got the daily Q and are waiting to answer
+daily_wait: set[int]            = set()
+# ── Duel state ────────────────────────────────────────────────────────────────
+pending_duels: dict[str, dict]  = {}  # duel_id -> awaiting acceptance
+active_duels:  dict[str, dict]  = {}  # duel_id -> live duel
+user_to_duel:  dict[int, str]   = {}  # uid -> duel_id
+duel_setup:    dict[int, dict]  = {}  # challenger uid -> setup step
 
 # ── Conversation history ───────────────────────────────────────────────────────
 def build_messages(uid: int, content) -> list[dict]:
@@ -551,6 +562,35 @@ def format_question(q: dict, idx: int, total: int) -> str:
         "Reply with A, B, C, or D"
     )
 
+def format_duel_question(q: dict, idx: int, total: int) -> str:
+    return (
+        f"[DUEL] Question {idx}/{total}\n\n"
+        f"{q['q']}\n\n"
+        f"A)  {q['A']}\nB)  {q['B']}\nC)  {q['C']}\nD)  {q['D']}\n\n"
+        "Both players reply A, B, C, or D"
+    )
+
+def build_duel_result(duel: dict) -> str:
+    cid = duel["challenger_id"]
+    did = duel["challenged_id"]
+    cs  = duel["scores"].get(cid, 0)
+    ds  = duel["scores"].get(did, 0)
+    tot = len(duel["questions"])
+    if cs > ds:
+        winner = f"{duel['challenger_name']} WINS!"
+    elif ds > cs:
+        winner = f"{duel['challenged_name']} WINS!"
+    else:
+        winner = "Dead tie! Both are legends."
+    return (
+        f"=== DUEL OVER ===\n\n"
+        f"{duel['challenger_name']}  :  {cs}/{tot}\n"
+        f"{duel['challenged_name']}  :  {ds}/{tot}\n\n"
+        f"Chapter: {duel['chapter']} — {duel['topic']}\n\n"
+        f"{winner}\n\n"
+        "Type /challenge to rematch!"
+    )
+
 def quiz_result_text(score: int, total: int, chapter: str, topic: str) -> str:
     pct   = (score / total) * 100
     grade = get_grade(pct)
@@ -589,15 +629,73 @@ async def photo_to_base64(msg: Message, context: ContextTypes.DEFAULT_TYPE) -> s
     return base64.standard_b64encode(data).decode()
 
 def strip_mention(text: str) -> str:
-    if not BOT_USERNAME:
-        return text.strip()
-    return " ".join(p for p in text.split() if p.lower() != f"@{BOT_USERNAME}").strip()
+    """Remove @username and bot name from text so the question is clean."""
+    out = text
+    if BOT_USERNAME:
+        out = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", out, flags=re.IGNORECASE)
+    if BOT_NAME:
+        out = re.sub(rf"\b{re.escape(BOT_NAME)}\b", "", out, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", out).strip()
 
 def is_group_chat(update: Update) -> bool:
     return update.message.chat.type in ("group", "supergroup")
 
-def bot_mentioned(text: str) -> bool:
-    return bool(BOT_USERNAME) and f"@{BOT_USERNAME}" in text.lower()
+def should_respond_in_group(update: Update, text: str = "") -> bool:
+    """
+    Decide whether the bot should respond to a group message.
+
+    Priority order:
+      1. User is inside an active bot flow (quiz / daily / identify) — always respond.
+      2. Telegram entity-based @mention  (most reliable — official Telegram markup).
+      3. Telegram TEXT_MENTION entity    (tag without username, matched by bot user-id).
+      4. Direct reply to any of the bot's own messages.
+      5. Bot display-name appears anywhere in the text (word-boundary match).
+      6. Generic bot-addressing patterns: "bot, ...", "hey bot", message starts with "bot ".
+    """
+    msg      = update.message
+    uid      = update.effective_user.id if update.effective_user else None
+    raw_text = text or msg.text or msg.caption or ""
+    t        = raw_text.lower().strip()
+
+    # ── 1. Active per-user state ───────────────────────────────────────────────
+    if uid and (uid in daily_wait or uid in identify_wait or
+                uid in quiz_setup or uid in active_quiz or
+                uid in duel_setup or uid in user_to_duel):
+        return True
+
+    # ── 2 & 3. Official Telegram entity mentions ──────────────────────────────
+    # Telegram explicitly tags @mentions with MessageEntity.MENTION and
+    # name-based mentions (no @) with MessageEntity.TEXT_MENTION.
+    # This is far more reliable than scanning the raw string.
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    for ent in entities:
+        if ent.type == MessageEntity.MENTION and BOT_USERNAME:
+            # entity covers "@username" in raw_text; strip @ to compare
+            handle = raw_text[ent.offset: ent.offset + ent.length].lstrip("@").lower()
+            if handle == BOT_USERNAME.lower():
+                return True
+        elif ent.type == MessageEntity.TEXT_MENTION and BOT_ID:
+            # Mention of a user who has no public username — matched by id
+            if ent.user and ent.user.id == BOT_ID:
+                return True
+
+    # ── 4. Direct reply to the bot's own message ──────────────────────────────
+    rt = msg.reply_to_message
+    if rt and rt.from_user and rt.from_user.is_bot:
+        replied_uname = (rt.from_user.username or "").lower()
+        if not BOT_USERNAME or replied_uname == BOT_USERNAME.lower():
+            return True
+
+    # ── 5. Bot display-name in text (word-boundary, case-insensitive) ─────────
+    if BOT_NAME and re.search(rf"\b{re.escape(BOT_NAME.lower())}\b", t):
+        return True
+
+    # ── 6. Generic bot-addressing patterns ────────────────────────────────────
+    # Catches: "bot, solve this", "hey bot", "aye bot", "bot please help me"
+    if re.search(r"(^|[\s,!?])bot[\s,!?:]", t) or t.startswith("bot "):
+        return True
+
+    return False
 
 def get_display_name(user) -> str:
     return (user.username and f"@{user.username}") or user.full_name or "Unknown"
@@ -755,6 +853,100 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(build_mystats_text(update.effective_user.id))
 
+# ── /challenge ────────────────────────────────────────────────────────────────
+async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_group_chat(update):
+        await update.message.reply_text("Challenges only work in group chats — add me to a group!")
+        return
+    args = context.args
+    if not args or not args[0].startswith("@"):
+        await update.message.reply_text("Usage: /challenge @username [1-10 questions]\nExample: /challenge @rahul 5")
+        return
+    challenger = update.effective_user
+    challenged_uname = args[0].lstrip("@").lower()
+    if challenged_uname == BOT_USERNAME.lower():
+        await update.message.reply_text("You can't challenge me — I'd ace every question!")
+        return
+    if challenger.username and challenged_uname == challenger.username.lower():
+        await update.message.reply_text("You can't challenge yourself!")
+        return
+    num = 5
+    if len(args) > 1 and args[1].isdigit():
+        num = max(1, min(10, int(args[1])))
+    duel_id = uuid.uuid4().hex[:8]
+    pending_duels[duel_id] = {
+        "chat_id":            update.message.chat_id,
+        "challenger_id":      challenger.id,
+        "challenger_name":    get_display_name(challenger),
+        "challenged_username": challenged_uname,
+        "num":                num,
+    }
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Accept", callback_data=f"duel_accept:{duel_id}"),
+        InlineKeyboardButton("Decline",  callback_data=f"duel_decline:{duel_id}"),
+    ]])
+    await update.message.reply_text(
+        f"@{challenged_uname}\n\n"
+        f"{get_display_name(challenger)} challenges you to a {num}-question JEE duel!\n"
+        "Do you accept?",
+        reply_markup=kb,
+    )
+
+async def handle_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not query.data or ":" not in query.data:
+        return
+    action, duel_id = query.data.split(":", 1)
+    if action not in ("duel_accept", "duel_decline"):
+        return
+    duel = pending_duels.get(duel_id)
+    if not duel:
+        await query.edit_message_text("This challenge has expired.")
+        return
+    user = query.from_user
+    if user.username and user.username.lower() != duel["challenged_username"].lower():
+        await query.answer("This challenge isn't for you!", show_alert=True)
+        return
+    if action == "duel_decline":
+        pending_duels.pop(duel_id, None)
+        await query.edit_message_text(f"{get_display_name(user)} declined. Scared of the competition!")
+        return
+    # Accepted
+    pending_duels.pop(duel_id, None)
+    active_duels[duel_id] = {
+        "chat_id":         duel["chat_id"],
+        "challenger_id":   duel["challenger_id"],
+        "challenger_name": duel["challenger_name"],
+        "challenged_id":   user.id,
+        "challenged_name": get_display_name(user),
+        "questions": [], "current": 0,
+        "scores":  {duel["challenger_id"]: 0, user.id: 0},
+        "answered": {},
+        "chapter": "", "topic": "", "num": duel["num"], "started": False,
+    }
+    user_to_duel[duel["challenger_id"]] = duel_id
+    user_to_duel[user.id]               = duel_id
+    duel_setup[duel["challenger_id"]]   = {"step": "chapter", "duel_id": duel_id}
+    await query.edit_message_text(
+        f"{get_display_name(user)} accepted!\n\n"
+        f"{duel['challenger_name']}, pick the battleground.\n"
+        "Which chapter? (e.g. Kinematics, Organic Chemistry, Matrices)"
+    )
+
+async def cmd_cancelchallenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    duel_id = user_to_duel.pop(uid, None)
+    duel_setup.pop(uid, None)
+    if duel_id and duel_id in active_duels:
+        duel = active_duels.pop(duel_id)
+        other = duel["challenged_id"] if duel["challenger_id"] == uid else duel["challenger_id"]
+        user_to_duel.pop(other, None)
+    cancelled = [k for k, v in pending_duels.items() if v["challenger_id"] == uid]
+    for k in cancelled:
+        pending_duels.pop(k, None)
+    await update.message.reply_text("Challenge cancelled." if (duel_id or cancelled) else "No active challenge to cancel.")
+
 # ── /rank ─────────────────────────────────────────────────────────────────────
 async def cmd_rank(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -802,7 +994,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     uid     = update.effective_user.id
     caption = msg.caption or ""
 
-    if is_group_chat(update) and not bot_mentioned(caption):
+    if is_group_chat(update) and not should_respond_in_group(update, caption):
         return
 
     clean_cap      = strip_mention(caption).strip().lower()
@@ -856,7 +1048,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uid      = update.effective_user.id
     user     = update.effective_user
 
-    if is_group_chat(update) and not bot_mentioned(text):
+    if is_group_chat(update) and not should_respond_in_group(update, text):
         return
 
     question = strip_mention(text).strip()
@@ -999,6 +1191,78 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await msg.reply_text(format_question(quiz["questions"][quiz["current"]], quiz["current"] + 1, quiz["total"]))
         return
 
+    # ── Duel setup flow (challenger picks chapter & topic) ────────────────────
+    if uid in duel_setup:
+        setup   = duel_setup[uid]
+        duel_id = setup["duel_id"]
+        if setup["step"] == "chapter":
+            setup["chapter"] = question
+            setup["step"]    = "topic"
+            await msg.reply_text(f"Chapter: {question}\nNow the topic? (e.g. Projectile Motion, Le Chatelier's Principle)")
+            return
+        if setup["step"] == "topic":
+            chapter = setup["chapter"]
+            topic   = question
+            num     = active_duels[duel_id]["num"]
+            duel_setup.pop(uid, None)
+            wait = await msg.reply_text(f"Generating {num} duel questions on {chapter} — {topic}...")
+            questions = await generate_quiz_questions(num, chapter, topic)
+            await wait.delete()
+            if not questions:
+                active_duels.pop(duel_id, None)
+                user_to_duel.pop(active_duels.get(duel_id, {}).get("challenged_id"), None)
+                user_to_duel.pop(uid, None)
+                await msg.reply_text("Couldn't generate questions. Try /challenge again.")
+                return
+            duel = active_duels[duel_id]
+            duel.update({"questions": questions, "chapter": chapter, "topic": topic, "started": True})
+            await msg.reply_text(
+                f"=== DUEL ===\n"
+                f"{duel['challenger_name']}  vs  {duel['challenged_name']}\n"
+                f"Chapter: {chapter} — {topic}  |  {len(questions)} questions\n\n"
+                "Both players answer each question. Let the battle begin!"
+            )
+            await msg.reply_text(format_duel_question(questions[0], 1, len(questions)))
+            return
+
+    # ── Duel answer flow ──────────────────────────────────────────────────────
+    if uid in user_to_duel:
+        duel_id = user_to_duel[uid]
+        duel    = active_duels.get(duel_id)
+        if duel and duel.get("started"):
+            ans = question.strip().upper()
+            if ans not in ("A", "B", "C", "D"):
+                await msg.reply_text("Reply with A, B, C, or D for the duel question.", **kwargs)
+                return
+            cur = duel["current"]
+            duel["answered"].setdefault(cur, {})
+            if uid in duel["answered"][cur]:
+                await msg.reply_text("Already answered — waiting for your opponent.", **kwargs)
+                return
+            duel["answered"][cur][uid] = ans
+            correct  = duel["questions"][cur]["ans"]
+            is_right = ans == correct
+            if is_right:
+                duel["scores"][uid] += 1
+            await msg.reply_text(
+                f"{'Correct!' if is_right else f'Wrong — answer was {correct}.'} "
+                f"(Your score: {duel['scores'][uid]})",
+                **kwargs,
+            )
+            both = {duel["challenger_id"], duel["challenged_id"]}
+            if set(duel["answered"][cur].keys()) == both:
+                duel["current"] += 1
+                if duel["current"] >= len(duel["questions"]):
+                    result = build_duel_result(duel)
+                    user_to_duel.pop(duel["challenger_id"], None)
+                    user_to_duel.pop(duel["challenged_id"], None)
+                    active_duels.pop(duel_id, None)
+                    await msg.reply_text(result)
+                else:
+                    nq = duel["questions"][duel["current"]]
+                    await msg.reply_text(format_duel_question(nq, duel["current"] + 1, len(duel["questions"])))
+            return
+
     # ── Normal doubt solving ──────────────────────────────────────────────────
     prompt = f"Give only a HINT (no solution) for: {question}" if "hint" in question.lower() else question
     raw    = await ask(uid, prompt)
@@ -1008,6 +1272,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ── Register commands with Telegram ───────────────────────────────────────────
 async def post_init(app) -> None:
+    global BOT_USERNAME, BOT_NAME, BOT_ID
+    me = await app.bot.get_me()
+    BOT_USERNAME = (me.username or "").lower()
+    BOT_NAME     = me.first_name or ""
+    BOT_ID       = me.id
+    logger.info("Bot identity: id=%d  @%s  name='%s'", BOT_ID, BOT_USERNAME, BOT_NAME)
+
     await app.bot.set_my_commands([
         BotCommand("start",       "Welcome and usage guide"),
         BotCommand("help",        "Show all commands"),
@@ -1023,8 +1294,10 @@ async def post_init(app) -> None:
         BotCommand("mystats",     "Your personal quiz stats"),
         BotCommand("rank",        "Your position on the leaderboard"),
         BotCommand("motivate",    "Get a motivational quote"),
-        BotCommand("tips",        "Study and stress management tips"),
-        BotCommand("clear",       "Reset conversation and quiz state"),
+        BotCommand("tips",            "Study and stress management tips"),
+        BotCommand("challenge",       "Duel another student — /challenge @username"),
+        BotCommand("cancelchallenge", "Cancel your current challenge"),
+        BotCommand("clear",           "Reset conversation and quiz state"),
     ])
     logger.info("Commands registered with Telegram")
 
@@ -1047,8 +1320,11 @@ def main() -> None:
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     app.add_handler(CommandHandler("mystats",     cmd_mystats))
     app.add_handler(CommandHandler("rank",        cmd_rank))
-    app.add_handler(CommandHandler("motivate",    cmd_motivate))
-    app.add_handler(CommandHandler("tips",        cmd_tips))
+    app.add_handler(CommandHandler("motivate",        cmd_motivate))
+    app.add_handler(CommandHandler("tips",            cmd_tips))
+    app.add_handler(CommandHandler("challenge",       cmd_challenge))
+    app.add_handler(CommandHandler("cancelchallenge", cmd_cancelchallenge))
+    app.add_handler(CallbackQueryHandler(handle_duel_callback, pattern=r"^duel_(accept|decline):"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
